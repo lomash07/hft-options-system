@@ -1,0 +1,93 @@
+# ==============================================
+# HFT Options Trading System - Infrastructure
+# docker-compose.yml
+# ==============================================
+
+version: "3.9"
+
+services:
+  # ── Redis (Message Bus + Feature Cache) ──
+  redis:
+    image: redis:7-alpine
+    container_name: hft-redis
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── TimescaleDB (Time-Series Storage) ──
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: hft-timescaledb
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: hft
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-hft_dev_2024}
+      POSTGRES_DB: hft_options
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+      - ./config/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hft"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Grafana (Dashboards) ──
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: hft-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_INSTALL_PLUGINS: grafana-clock-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - timescaledb
+    restart: unless-stopped
+
+  # ── Prometheus (Metrics) ──
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hft-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+
+  # ── IB Gateway (Headless TWS) ──
+  # Uncomment when ready for IB connection
+  # ib-gateway:
+  #   image: ghcr.io/gnzsnz/ib-gateway:stable
+  #   container_name: hft-ib-gateway
+  #   ports:
+  #     - "4001:4001"   # Live trading
+  #     - "4002:4002"   # Paper trading
+  #   environment:
+  #     TWS_USERID: ${IB_USERNAME}
+  #     TWS_PASSWORD: ${IB_PASSWORD}
+  #     TRADING_MODE: paper
+  #   restart: unless-stopped
+
+volumes:
+  redis_data:
+  timescale_data:
+  grafana_data:
+  prometheus_data:
