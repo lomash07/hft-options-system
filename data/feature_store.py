@@ -2,13 +2,9 @@
 Feature Store.
 
 Computes and caches real-time features in Redis for agent consumption.
-Updates on every price bar or options chain refresh.
 
-Features per ticker:
-  - Price: vwap, spread, relative_volume, daily_change
-  - IV: iv_rank, iv_percentile, iv_rv_ratio, skew, term_structure
-  - Flow: put_call_ratio, unusual_volume_flags
-  - Context: beta_spy, days_to_earnings, sector
+FIX: initialize() now uses batch yf.download() — ONE request for all 22 tickers
+     instead of 22 individual requests that trigger rate limits.
 """
 
 from __future__ import annotations
@@ -27,7 +23,7 @@ from core.models import (
     IVMetrics, OptionsChain, PriceBar, TickerSnapshot,
 )
 from core.database import db
-from data.broker_feed import DataFeed
+from data.broker_feed import DataFeed, YFinanceFeed
 from data.options_analytics import OptionsAnalytics, options_analytics
 
 logger = structlog.get_logger()
@@ -57,35 +53,94 @@ class FeatureStore:
         self._chains: Dict[str, OptionsChain] = {}
         self._avg_volumes: Dict[str, float] = {}
         self._prev_closes: Dict[str, float] = {}
+        self._prices: Dict[str, float] = {}
 
     async def initialize(self) -> None:
-        """Load historical data needed for feature computation."""
+        """
+        Load historical data needed for feature computation.
+        
+        KEY FIX: Uses batch download (1 API call) instead of
+        22 individual requests that trigger Yahoo rate limits.
+        """
         logger.info("feature_store.initializing", tickers=len(ALL_TICKERS))
 
-        for ticker in ALL_TICKERS:
-            try:
-                df = await self.feed.get_historical_bars(ticker, days=30)
-                if not df.empty:
-                    self._avg_volumes[ticker] = float(
-                        df["Volume"].rolling(20).mean().iloc[-1]
-                    )
-                    self._prev_closes[ticker] = float(df["Close"].iloc[-2])
+        # ── BATCH download all history in ONE request ──
+        if isinstance(self.feed, YFinanceFeed):
+            history = await self.feed.batch_download_history(
+                ALL_TICKERS, period="60d"
+            )
 
-                    # Store IV history for rank calculation
-                    # (uses daily close as proxy until we have chain data)
+            for ticker, df in history.items():
+                try:
+                    if df.empty or len(df) < 5:
+                        continue
+
+                    # Average volume (20-day)
+                    vol_series = df["Volume"].rolling(20).mean()
+                    valid_vol = vol_series.dropna()
+                    if not valid_vol.empty:
+                        self._avg_volumes[ticker] = float(valid_vol.iloc[-1])
+
+                    # Previous close
+                    if len(df) >= 2:
+                        self._prev_closes[ticker] = float(df["Close"].iloc[-2])
+
+                    # Current price
+                    self._prices[ticker] = float(df["Close"].iloc[-1])
+
+                    # Store IV history proxy (realized vol)
                     closes = df["Close"].tolist()
                     rv = options_analytics.compute_realized_vol(closes)
                     if rv > 0:
                         db.store_iv_close(ticker, rv)
 
-            except Exception as e:
-                logger.warning(
-                    "feature_store.init_error",
-                    ticker=ticker, error=str(e),
-                )
-                continue
+                except Exception as e:
+                    logger.warning(
+                        "feature_store.init_ticker_error",
+                        ticker=ticker, error=str(e),
+                    )
+                    continue
+
+            logger.info(
+                "feature_store.batch_loaded",
+                loaded=len(history),
+                prices=len(self._prices),
+                volumes=len(self._avg_volumes),
+            )
+
+        else:
+            # Non-yfinance feed: fetch individually (IB handles rate limits)
+            for ticker in ALL_TICKERS:
+                try:
+                    df = await self.feed.get_historical_bars(ticker, days=60)
+                    if not df.empty:
+                        vol_series = df["Volume"].rolling(20).mean()
+                        valid_vol = vol_series.dropna()
+                        if not valid_vol.empty:
+                            self._avg_volumes[ticker] = float(valid_vol.iloc[-1])
+                        if len(df) >= 2:
+                            self._prev_closes[ticker] = float(df["Close"].iloc[-2])
+                        self._prices[ticker] = float(df["Close"].iloc[-1])
+                except Exception as e:
+                    logger.warning(
+                        "feature_store.init_error",
+                        ticker=ticker, error=str(e),
+                    )
+                    continue
 
         logger.info("feature_store.initialized")
+
+    def get_cached_price(self, ticker: str) -> Optional[float]:
+        """Get price from batch-loaded cache. No API call."""
+        return self._prices.get(ticker)
+
+    def get_prev_close(self, ticker: str) -> Optional[float]:
+        """Get previous close from cache. No API call."""
+        return self._prev_closes.get(ticker)
+
+    def get_avg_volume(self, ticker: str) -> Optional[float]:
+        """Get 20-day average volume from cache. No API call."""
+        return self._avg_volumes.get(ticker)
 
     async def update_ticker(self, ticker: str) -> Optional[TickerSnapshot]:
         """
@@ -95,35 +150,37 @@ class FeatureStore:
         try:
             bar = await self.feed.get_price_bar(ticker)
             if not bar:
-                return None
+                # Fallback to cached price
+                price = self._prices.get(ticker)
+                if not price:
+                    return None
+                bar = PriceBar(
+                    time=datetime.utcnow(), ticker=ticker,
+                    open=price, high=price, low=price,
+                    close=price, volume=0,
+                )
 
             price = bar.close
-            volume = bar.volume
 
             # Relative volume
             avg_vol = self._avg_volumes.get(ticker, 0)
-            rel_vol = volume / avg_vol if avg_vol > 0 else 1.0
+            rel_vol = bar.volume / avg_vol if avg_vol > 0 else 1.0
 
             # Daily change
             prev_close = self._prev_closes.get(ticker, price)
             daily_change = (price - prev_close) / prev_close if prev_close > 0 else 0
 
-            # Gap (pre-market only, use first bar)
-            gap_pct = daily_change  # Simplified; refine with actual gap logic
+            gap_pct = daily_change
 
             # IV metrics from cached chain
             iv_metrics = self.analytics.get_cached_metrics(ticker)
-
-            # Days to earnings
-            days_to_earn = None
-            # Will be filled by scanner module
 
             snapshot = TickerSnapshot(
                 ticker=ticker,
                 timestamp=datetime.utcnow(),
                 price=price,
                 vwap=bar.vwap or price,
-                volume=volume,
+                volume=bar.volume,
                 relative_volume=round(rel_vol, 2),
                 daily_change_pct=round(daily_change * 100, 2),
                 gap_pct=round(gap_pct * 100, 2),
@@ -137,7 +194,7 @@ class FeatureStore:
             await event_bus.set_hash(f"ticker:{ticker}", {
                 "price": price,
                 "vwap": bar.vwap or price,
-                "volume": volume,
+                "volume": bar.volume,
                 "rel_volume": round(rel_vol, 2),
                 "daily_change_pct": round(daily_change * 100, 2),
                 "gap_pct": round(gap_pct * 100, 2),
@@ -165,7 +222,7 @@ class FeatureStore:
     ) -> Optional[OptionsChain]:
         """
         Refresh options chain and IV metrics for a ticker.
-        Called every 1-5 minutes.
+        Called every 5 minutes.
         """
         try:
             chain = await self.feed.get_options_chain(ticker)
@@ -181,7 +238,7 @@ class FeatureStore:
                 chain, iv_history
             )
 
-            # Store chain snapshot in DB (every 5 min)
+            # Store chain snapshot in DB
             quotes_data = [
                 {
                     "time": chain.timestamp,
@@ -196,7 +253,7 @@ class FeatureStore:
                     "delta": q.delta, "gamma": q.gamma,
                     "theta": q.theta, "vega": q.vega,
                 }
-                for q in chain.quotes[:200]  # Limit to relevant strikes
+                for q in chain.quotes[:200]
             ]
             await db.insert_options_snapshot(quotes_data)
 
@@ -246,8 +303,6 @@ class FeatureStore:
     ) -> None:
         """
         Continuous update loop for all tickers.
-        Price: every `interval` seconds
-        Options chains: every 5 * `interval` seconds
         """
         logger.info(
             "feature_store.loop_started",
@@ -259,15 +314,15 @@ class FeatureStore:
         while True:
             for ticker in tickers:
                 await self.update_ticker(ticker)
-                await asyncio.sleep(0.5)  # Rate limit
+                await asyncio.sleep(1)  # 1s between tickers
 
             # Update options chains less frequently
             chain_counter += 1
             if chain_counter >= 5:
                 chain_counter = 0
-                for ticker in tickers[:10]:  # Top 10 by priority
+                for ticker in tickers[:5]:  # Only top 5 to stay under rate limit
                     await self.update_options_chain(ticker)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(3)  # 3s between chain fetches
 
             await event_bus.send_heartbeat("feature_store")
             await asyncio.sleep(interval)

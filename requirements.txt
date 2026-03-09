@@ -31,7 +31,6 @@ feedparser==6.0.11
 
 # Technical Analysis
 pandas==2.2.0
-pandas-ta==0.3.14b1
 
 # Monitoring & Alerts
 python-telegram-bot==20.7
